@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1" />
+    <title>Visual Album — POC</title>
+    <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+
+    <script>
+      /*
+       * audio-reactive
+       * ----------------
+       * Reads the playing track's frequency data with the Web Audio API and
+       * drives this entity's scale, colour and glow from it.
+       *
+       * The spectrum is split into three coarse bands:
+       *   bass   -> overall size (the "heartbeat")
+       *   mid    -> hue / colour drift
+       *   treble -> emissive glow + a faster shimmer on top of the pulse
+       */
+      AFRAME.registerComponent('audio-reactive', {
+        schema: {
+          smoothing: { default: 0.8 },   // 0..1, higher = smoother/laggier
+          bassGain:  { default: 1.6 },   // how hard bass drives scale
+          baseScale: { default: 1.0 }
+        },
+
+        init: function () {
+          this.audio = document.querySelector('#track');
+          this.ready = false;
+
+          // The AudioContext must be created/resumed from a user gesture,
+          // so we defer all wiring until "begin" fires (see the scene script).
+          this.el.sceneEl.addEventListener('begin', () => this.setupAudioGraph());
+
+          // Smoothed values we lerp toward every tick for a fluid feel.
+          this._scale = this.data.baseScale;
+          this._glow = 0;
+          this._hue = 210; // start near the sphere's blue
+        },
+
+        setupAudioGraph: function () {
+          if (this.ready) return;
+
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          const ctx = new Ctx();
+          ctx.resume();
+
+          // createMediaElementSource may only be called once per element.
+          const source = ctx.createMediaElementSource(this.audio);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 512;
+          analyser.smoothingTimeConstant = this.data.smoothing;
+
+          source.connect(analyser);
+          analyser.connect(ctx.destination); // keep the sound audible
+
+          this.ctx = ctx;
+          this.analyser = analyser;
+          this.freq = new Uint8Array(analyser.frequencyBinCount); // 256 bins
+          this.ready = true;
+        },
+
+        // Average a slice of the frequency array, normalised to 0..1.
+        bandAvg: function (fromFrac, toFrac) {
+          const n = this.freq.length;
+          const start = Math.floor(n * fromFrac);
+          const end = Math.floor(n * toFrac);
+          let sum = 0;
+          for (let i = start; i < end; i++) sum += this.freq[i];
+          return (end > start) ? (sum / (end - start)) / 255 : 0;
+        },
+
+        tick: function (time, dt) {
+          if (!this.ready) return;
+          this.analyser.getByteFrequencyData(this.freq);
+
+          const bass   = this.bandAvg(0.00, 0.10);
+          const mid    = this.bandAvg(0.10, 0.40);
+          const treble = this.bandAvg(0.40, 0.90);
+
+          // Targets --------------------------------------------------------
+          const targetScale =
+            this.data.baseScale + bass * this.data.bassGain + treble * 0.25;
+          const targetGlow = Math.min(treble * 2.2 + bass * 0.6, 3.0);
+          const targetHue = 200 + mid * 140; // 200 (blue) .. 340 (magenta)
+
+          // Smooth toward targets (frame-rate independent) ---------------
+          const k = 1 - Math.pow(0.001, (dt || 16) / 1000);
+          this._scale += (targetScale - this._scale) * k;
+          this._glow += (targetGlow - this._glow) * k;
+          this._hue += (targetHue - this._hue) * k * 0.5;
+
+          const s = this._scale;
+          this.el.object3D.scale.set(s, s, s);
+          this.el.object3D.rotation.y += (0.05 + mid * 0.6) * (dt || 16) / 1000;
+
+          const color = `hsl(${this._hue.toFixed(0)}, 80%, 60%)`;
+          this.el.setAttribute('material', {
+            color: color,
+            emissive: color,
+            emissiveIntensity: this._glow
+          });
+        }
+      });
+
+      /*
+       * A faint particle shell around the reactive core so the void has
+       * some depth to it once the music is going. Purely cosmetic.
+       */
+      AFRAME.registerComponent('drift', {
+        schema: { speed: { default: 0.02 } },
+        tick: function (t, dt) {
+          this.el.object3D.rotation.y += this.data.speed * (dt || 16) / 1000;
+          this.el.object3D.rotation.x += this.data.speed * 0.4 * (dt || 16) / 1000;
+        }
+      });
+    </script>
+  </head>
+
+  <body>
+    <!--
+      The track is chosen by URL, so one page serves many songs:
+        index.html                     -> DEFAULT_TRACK below
+        index.html?track=nightdrive    -> nightdrive.m4a  (extension optional)
+        index.html?track=demos/v2.mp3  -> demos/v2.mp3
+        index.html?track=https://host/song.m4a
+    -->
+    <audio id="track" preload="auto" crossorigin="anonymous"></audio>
+    <script>
+      (function () {
+        const DEFAULT_TRACK = 'track.m4a';
+        let src = new URLSearchParams(location.search).get('track') || DEFAULT_TRACK;
+        if (!/\.[a-z0-9]{2,4}$/i.test(src)) src += '.m4a'; // bare name -> add extension
+        document.getElementById('track').src = src;
+      })();
+    </script>
+
+    <a-scene background="color: #000000" renderer="colorManagement: true; exposure: 1.2">
+
+      <a-sky color="#000000"></a-sky>
+
+      <!-- The reactive core ------------------------------------------------ -->
+      <a-icosahedron
+        id="core"
+        position="0 1.6 -3"
+        radius="0.5"
+        detail="2"
+        material="color: #4488ff; emissive: #4488ff; emissiveIntensity: 0; metalness: 0.1; roughness: 0.35; flatShading: true"
+        audio-reactive>
+      </a-icosahedron>
+
+      <!-- Cosmetic particle shell --------------------------------------- -->
+      <a-entity position="0 1.6 -3" drift="speed: 0.03">
+        <a-entity
+          id="shell"
+          geometry="primitive: sphere; radius: 3; segmentsWidth: 24; segmentsHeight: 16"
+          material="color: #1b2a55; wireframe: true; opacity: 0.25; transparent: true">
+        </a-entity>
+      </a-entity>
+
+      <!-- Tap-to-begin panel ------------------------------------------------ -->
+      <a-plane
+        id="start"
+        class="clickable"
+        position="0 1.6 -2.4"
+        width="2.4" height="1"
+        color="#111"
+        material="opacity: 0.9; transparent: true"
+        text="value: Tap to begin; align: center; width: 3; color: #ffffff">
+      </a-plane>
+
+      <!-- Lighting: dim, so the emissive core does the talking ----------- -->
+      <a-entity light="type: ambient; color: #223; intensity: 0.4"></a-entity>
+      <a-entity light="type: point; intensity: 0.3; distance: 12" position="0 4 0"></a-entity>
+
+      <!-- Camera + gaze cursor ---------------------------------------------- -->
+      <a-entity camera position="0 1.6 0" look-controls wasd-controls="acceleration: 20">
+        <a-cursor
+          fuse="false"
+          raycaster="objects: .clickable"
+          material="color: #ffffff; shader: flat"
+          geometry="primitive: ring; radiusInner: 0.012; radiusOuter: 0.02">
+        </a-cursor>
+      </a-entity>
+
+      <!-- Quest controllers (either hand can point + trigger) ----------- -->
+      <a-entity laser-controls="hand: right" raycaster="objects: .clickable; lineColor: #4488ff"></a-entity>
+      <a-entity laser-controls="hand: left"  raycaster="objects: .clickable; lineColor: #4488ff"></a-entity>
+    </a-scene>
+
+    <script>
+      // Gate audio behind a user gesture (autoplay policy, stricter on Quest).
+      const sceneEl = document.querySelector('a-scene');
+      const startEl = document.querySelector('#start');
+      const audio = document.querySelector('#track');
+      let begun = false;
+
+      function begin() {
+        if (begun) return;
+        begun = true;
+
+        audio.play().catch((err) => {
+          console.error('audio.play() failed:', err);
+          startEl.setAttribute('text', 'value: Audio blocked — check console; align: center; width: 3; color: #ff6666');
+          begun = false;
+        });
+
+        // audio-reactive listens for this to build + resume its AudioContext.
+        sceneEl.emit('begin');
+        startEl.setAttribute('visible', false);
+        startEl.classList.remove('clickable');
+      }
+
+      // VR cursor / controller trigger both dispatch 'click' on the entity.
+      startEl.addEventListener('click', begin);
+      // Desktop convenience: click anywhere or press space/enter.
+      window.addEventListener('keydown', (e) => {
+        if (e.code === 'Space' || e.code === 'Enter') begin();
+      });
+    </script>
+  </body>
+</html>
